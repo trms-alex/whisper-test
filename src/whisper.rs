@@ -94,16 +94,16 @@ struct DecodingResult {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-struct Segment {
+pub struct Segment {
     start: f64,
     duration: f64,
     dr: DecodingResult,
 }
 
-struct Decoder {
+pub struct Decoder {
     model: Model,
     rng: rand::rngs::StdRng,
-    task: Option<Task>,
+    task: Task,
     timestamps: bool,
     verbose: bool,
     tokenizer: Tokenizer,
@@ -115,20 +115,88 @@ struct Decoder {
     no_speech_token: u32,
     no_timestamps_token: u32,
     language_token: Option<u32>,
+    device: Device,
+    config: Config,
+    mel_filters: Vec<f32>,
 }
 
 impl Decoder {
     #[allow(clippy::too_many_arguments)]
-    fn new(
-        model: Model,
-        tokenizer: Tokenizer,
+    pub fn new(
+        which_model: WhichModel,
+        quantized: bool,
         seed: u64,
-        device: &Device,
-        language_token: Option<u32>,
-        task: Option<Task>,
+        language: &str,
+        task: Task,
         timestamps: bool,
         verbose: bool,
     ) -> Result<Self> {
+        let device = device(false)?;
+
+        let (default_model, default_revision) = if quantized {
+            ("lmz/candle-whisper", "main")
+        } else {
+            which_model.model_and_revision()
+        };
+        let model_id = default_model.to_string();
+        let revision = default_revision.to_string();
+        let (config_filename, tokenizer_filename, weights_filename) = {
+            let api = Api::new()?;
+            let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+            let (config, tokenizer, model) = if quantized {
+                let ext = match which_model {
+                    WhichModel::TinyEn => "tiny-en",
+                    WhichModel::Tiny => "tiny",
+                    _ => unimplemented!("no quantized support for {:?}", which_model),
+                };
+                (
+                    repo.get(&format!("config-{ext}.json"))?,
+                    repo.get(&format!("tokenizer-{ext}.json"))?,
+                    repo.get(&format!("model-{ext}-q80.gguf"))?,
+                )
+            } else {
+                let config = repo.get("config.json")?;
+                let tokenizer = repo.get("tokenizer.json")?;
+                let model = repo.get("model.safetensors")?;
+                (config, tokenizer, model)
+            };
+            (config, tokenizer, model)
+        };
+        let config: Config = serde_json::from_str(&std::fs::read_to_string(config_filename)?)?;
+        let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+
+        let model = if quantized {
+            let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
+                &weights_filename,
+            )?;
+            Model::Quantized(m::quantized_model::Whisper::load(&vb, config.clone())?)
+        } else {
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&[weights_filename], m::DTYPE, &device)?
+            };
+            Model::Normal(m::model::Whisper::load(&vb, config.clone())?)
+        };
+
+        let language_token = if which_model.is_multilingual() {
+            match token_id(&tokenizer, &format!("<|{language}|>")) {
+                Ok(token_id) => Some(token_id),
+                Err(_) => anyhow::bail!("language {language} is not supported"),
+            }
+        } else {
+            None
+        };
+
+        let mel_bytes = match config.num_mel_bins {
+            80 => include_bytes!("../melfilters.bytes").as_slice(),
+            128 => include_bytes!("../melfilters128.bytes").as_slice(),
+            nmel => anyhow::bail!("unexpected num_mel_bins {nmel}"),
+        };
+        let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
+        <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
+            mel_bytes,
+            &mut mel_filters,
+        );
+
         let no_timestamps_token = token_id(&tokenizer, m::NO_TIMESTAMPS_TOKEN)?;
         // Suppress the notimestamps token when in timestamps mode.
         // https://github.com/openai/whisper/blob/e8622f9afc4eba139bf796c210f5c01081000472/whisper/decoding.py#L452
@@ -143,7 +211,7 @@ impl Decoder {
                 }
             })
             .collect();
-        let suppress_tokens = Tensor::new(suppress_tokens.as_slice(), device)?;
+        let suppress_tokens = Tensor::new(suppress_tokens.as_slice(), &device)?;
         let sot_token = token_id(&tokenizer, m::SOT_TOKEN)?;
         let transcribe_token = token_id(&tokenizer, m::TRANSCRIBE_TOKEN)?;
         let translate_token = token_id(&tokenizer, m::TRANSLATE_TOKEN)?;
@@ -164,6 +232,9 @@ impl Decoder {
             no_speech_token,
             language_token,
             no_timestamps_token,
+            device,
+            config,
+            mel_filters,
         })
     }
 
@@ -181,8 +252,8 @@ impl Decoder {
             tokens.push(language_token);
         }
         match self.task {
-            None | Some(Task::Transcribe) => tokens.push(self.transcribe_token),
-            Some(Task::Translate) => tokens.push(self.translate_token),
+            Task::Transcribe => tokens.push(self.transcribe_token),
+            Task::Translate => tokens.push(self.translate_token),
         }
         if !self.timestamps {
             tokens.push(self.no_timestamps_token);
@@ -276,7 +347,20 @@ impl Decoder {
         unreachable!()
     }
 
-    fn run(&mut self, mel: &Tensor) -> Result<Vec<Segment>> {
+    pub fn run(&mut self, samples: &[f32]) -> Result<Vec<Segment>> {
+        let mel = audio::pcm_to_mel(&self.config, samples, &self.mel_filters);
+        let mel_len = mel.len();
+        let mel = Tensor::from_vec(
+            mel,
+            (
+                1,
+                self.config.num_mel_bins,
+                mel_len / self.config.num_mel_bins,
+            ),
+            &self.device,
+        )?;
+        println!("loaded mel: {:?}", mel.dims());
+
         let (_, _, content_frames) = mel.dims3()?;
         let mut seek = 0;
         let mut segments = vec![];
@@ -359,12 +443,14 @@ pub fn token_id(tokenizer: &Tokenizer, token: &str) -> candle_core::Result<u32> 
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum Task {
     Transcribe,
     Translate,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhichModel {
     Tiny,
@@ -416,110 +502,4 @@ impl WhichModel {
             Self::DistilLargeV2 => ("distil-whisper/distil-large-v2", "main"),
         }
     }
-}
-
-pub fn whisper_main(
-    cpu: bool,
-    which_model: WhichModel,
-    input: &str,
-    seed: u64,
-    quantized: bool,
-    language: &str,
-    task: Task,
-    timestamps: bool,
-) -> Result<()> {
-    let device = device(cpu)?;
-    let (default_model, default_revision) = if quantized {
-        ("lmz/candle-whisper", "main")
-    } else {
-        which_model.model_and_revision()
-    };
-    let model_id = default_model.to_string();
-    let revision = default_revision.to_string();
-
-    let (config_filename, tokenizer_filename, weights_filename, input) = {
-        let api = Api::new()?;
-        let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
-        let sample = std::path::PathBuf::from(input);
-        let (config, tokenizer, model) = if quantized {
-            let ext = match which_model {
-                WhichModel::TinyEn => "tiny-en",
-                WhichModel::Tiny => "tiny",
-                _ => unimplemented!("no quantized support for {:?}", which_model),
-            };
-            (
-                repo.get(&format!("config-{ext}.json"))?,
-                repo.get(&format!("tokenizer-{ext}.json"))?,
-                repo.get(&format!("model-{ext}-q80.gguf"))?,
-            )
-        } else {
-            let config = repo.get("config.json")?;
-            let tokenizer = repo.get("tokenizer.json")?;
-            let model = repo.get("model.safetensors")?;
-            (config, tokenizer, model)
-        };
-        (config, tokenizer, model, sample)
-    };
-    let config: Config = serde_json::from_str(&std::fs::read_to_string(config_filename)?)?;
-    let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
-
-    let mel_bytes = match config.num_mel_bins {
-        80 => include_bytes!("../melfilters.bytes").as_slice(),
-        128 => include_bytes!("../melfilters128.bytes").as_slice(),
-        nmel => anyhow::bail!("unexpected num_mel_bins {nmel}"),
-    };
-    let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
-    <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(mel_bytes, &mut mel_filters);
-
-    let mut input = std::fs::File::open(input)?;
-    let (header, data) = wav::read(&mut input)?;
-    println!("loaded wav data: {header:?}");
-    if header.sampling_rate != m::SAMPLE_RATE as u32 {
-        anyhow::bail!("wav file must have a {} sampling rate", m::SAMPLE_RATE)
-    }
-    let data = data.as_sixteen().expect("expected 16 bit wav file");
-    let pcm_data: Vec<_> = data[..data.len() / header.channel_count as usize]
-        .iter()
-        .map(|v| *v as f32 / 32768.)
-        .collect();
-    println!("pcm data loaded {}", pcm_data.len());
-    let mel = audio::pcm_to_mel(&config, &pcm_data, &mel_filters);
-    let mel_len = mel.len();
-    let mel = Tensor::from_vec(
-        mel,
-        (1, config.num_mel_bins, mel_len / config.num_mel_bins),
-        &device,
-    )?;
-    println!("loaded mel: {:?}", mel.dims());
-
-    let model = if quantized {
-        let vb =
-            candle_transformers::quantized_var_builder::VarBuilder::from_gguf(&weights_filename)?;
-        Model::Quantized(m::quantized_model::Whisper::load(&vb, config)?)
-    } else {
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_filename], m::DTYPE, &device)? };
-        Model::Normal(m::model::Whisper::load(&vb, config)?)
-    };
-
-    let language_token = if which_model.is_multilingual() {
-        match token_id(&tokenizer, &format!("<|{language}|>")) {
-            Ok(token_id) => Some(token_id),
-            Err(_) => anyhow::bail!("language {language} is not supported"),
-        }
-    } else {
-        None
-    };
-    let mut dc = Decoder::new(
-        model,
-        tokenizer,
-        seed,
-        &device,
-        language_token,
-        Some(task),
-        timestamps,
-        true,
-    )?;
-    dbg!(dc.run(&mel)?);
-    Ok(())
 }
