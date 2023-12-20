@@ -15,13 +15,10 @@ use candle_core::{
     Device, IndexOp, Tensor,
 };
 use candle_nn::{ops::softmax, VarBuilder};
-use clap::{Parser, ValueEnum};
+use candle_transformers::models::whisper::{self as m, audio, Config};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use rand::{distributions::Distribution, SeedableRng};
 use tokenizers::Tokenizer;
-
-mod multilingual;
-use candle_transformers::models::whisper::{self as m, audio, Config};
 
 fn device(cpu: bool) -> Result<Device> {
     if cpu {
@@ -33,13 +30,11 @@ fn device(cpu: bool) -> Result<Device> {
     } else {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            println!(
-                "Running on CPU, to run on GPU(metal), build this example with `--features metal`"
-            );
+            println!("Running on CPU, to run on GPU(metal), build with `--features metal`");
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            println!("Running on CPU, to run on GPU, build this example with `--features cuda`");
+            println!("Running on CPU, to run on GPU, build with `--features cuda`");
         }
         Ok(Device::Cpu)
     }
@@ -364,32 +359,26 @@ pub fn token_id(tokenizer: &Tokenizer, token: &str) -> candle_core::Result<u32> 
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Task {
+#[derive(Clone, Copy, Debug)]
+pub enum Task {
     Transcribe,
     Translate,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum WhichModel {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhichModel {
     Tiny,
-    #[value(name = "tiny.en")]
     TinyEn,
     Base,
-    #[value(name = "base.en")]
     BaseEn,
     Small,
-    #[value(name = "small.en")]
     SmallEn,
     Medium,
-    #[value(name = "medium.en")]
     MediumEn,
     Large,
     LargeV2,
     LargeV3,
-    #[value(name = "distil-medium.en")]
     DistilMediumEn,
-    #[value(name = "distil-large-v2")]
     DistilLargeV2,
 }
 
@@ -429,106 +418,34 @@ impl WhichModel {
     }
 }
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Run on CPU rather than on GPU.
-    #[arg(long)]
+pub fn whisper_main(
     cpu: bool,
-
-    #[arg(long)]
-    model_id: Option<String>,
-
-    /// The model to use, check out available models:
-    /// https://huggingface.co/models?search=whisper
-    #[arg(long)]
-    revision: Option<String>,
-
-    /// The model to be used, can be tiny, small, medium.
-    #[arg(long, default_value = "tiny.en")]
-    model: WhichModel,
-
-    /// The input to be processed, in wav format, will default to `jfk.wav`. Alternatively
-    /// this can be set to sample:jfk, sample:gb1, ... to fetch a sample from the following
-    /// repo: https://huggingface.co/datasets/Narsil/candle_demo/
-    #[arg(long)]
-    input: Option<String>,
-
-    /// The seed to use when generating random samples.
-    #[arg(long, default_value_t = 299792458)]
+    which_model: WhichModel,
+    input: &str,
     seed: u64,
-
-    /// Enable tracing (generates a trace-timestamp.json file).
-    #[arg(long)]
-    tracing: bool,
-
-    #[arg(long)]
     quantized: bool,
-
-    /// Language.
-    #[arg(long)]
-    language: Option<String>,
-
-    /// Task, when no task is specified, the input tokens contain only the sot token which can
-    /// improve things when in no-timestamp mode.
-    #[arg(long)]
-    task: Option<Task>,
-
-    /// Timestamps mode, this is not fully implemented yet.
-    #[arg(long)]
+    language: &str,
+    task: Task,
     timestamps: bool,
-
-    /// Print the full DecodingResult structure rather than just the text.
-    #[arg(long)]
-    verbose: bool,
-}
-
-pub fn whisper_main() -> Result<()> {
-    use tracing_chrome::ChromeLayerBuilder;
-    use tracing_subscriber::prelude::*;
-
-    let args = Args::parse();
-    let _guard = if args.tracing {
-        let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
-        tracing_subscriber::registry().with(chrome_layer).init();
-        Some(guard)
-    } else {
-        None
-    };
-    let device = device(args.cpu)?;
-    let (default_model, default_revision) = if args.quantized {
+) -> Result<()> {
+    let device = device(cpu)?;
+    let (default_model, default_revision) = if quantized {
         ("lmz/candle-whisper", "main")
     } else {
-        args.model.model_and_revision()
+        which_model.model_and_revision()
     };
-    let default_model = default_model.to_string();
-    let default_revision = default_revision.to_string();
-    let (model_id, revision) = match (args.model_id, args.revision) {
-        (Some(model_id), Some(revision)) => (model_id, revision),
-        (Some(model_id), None) => (model_id, "main".to_string()),
-        (None, Some(revision)) => (default_model, revision),
-        (None, None) => (default_model, default_revision),
-    };
+    let model_id = default_model.to_string();
+    let revision = default_revision.to_string();
 
     let (config_filename, tokenizer_filename, weights_filename, input) = {
         let api = Api::new()?;
-        let dataset = api.dataset("Narsil/candle-examples".to_string());
         let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
-        let sample = if let Some(input) = args.input {
-            if let Some(sample) = input.strip_prefix("sample:") {
-                dataset.get(&format!("samples_{sample}.wav"))?
-            } else {
-                std::path::PathBuf::from(input)
-            }
-        } else {
-            println!("No audio file submitted: Downloading https://huggingface.co/datasets/Narsil/candle_demo/blob/main/samples_jfk.wav");
-            dataset.get("samples_jfk.wav")?
-        };
-        let (config, tokenizer, model) = if args.quantized {
-            let ext = match args.model {
+        let sample = std::path::PathBuf::from(input);
+        let (config, tokenizer, model) = if quantized {
+            let ext = match which_model {
                 WhichModel::TinyEn => "tiny-en",
                 WhichModel::Tiny => "tiny",
-                _ => unimplemented!("no quantized support for {:?}", args.model),
+                _ => unimplemented!("no quantized support for {:?}", which_model),
             };
             (
                 repo.get(&format!("config-{ext}.json"))?,
@@ -547,8 +464,8 @@ pub fn whisper_main() -> Result<()> {
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
     let mel_bytes = match config.num_mel_bins {
-        80 => include_bytes!("../../melfilters.bytes").as_slice(),
-        128 => include_bytes!("../../melfilters128.bytes").as_slice(),
+        80 => include_bytes!("../melfilters.bytes").as_slice(),
+        128 => include_bytes!("../melfilters128.bytes").as_slice(),
         nmel => anyhow::bail!("unexpected num_mel_bins {nmel}"),
     };
     let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
@@ -575,7 +492,7 @@ pub fn whisper_main() -> Result<()> {
     )?;
     println!("loaded mel: {:?}", mel.dims());
 
-    let mut model = if args.quantized {
+    let model = if quantized {
         let vb =
             candle_transformers::quantized_var_builder::VarBuilder::from_gguf(&weights_filename)?;
         Model::Quantized(m::quantized_model::Whisper::load(&vb, config)?)
@@ -585,27 +502,24 @@ pub fn whisper_main() -> Result<()> {
         Model::Normal(m::model::Whisper::load(&vb, config)?)
     };
 
-    let language_token = match (args.model.is_multilingual(), args.language) {
-        (true, None) => Some(multilingual::detect_language(&mut model, &tokenizer, &mel)?),
-        (false, None) => None,
-        (true, Some(language)) => match token_id(&tokenizer, &format!("<|{language}|>")) {
+    let language_token = if which_model.is_multilingual() {
+        match token_id(&tokenizer, &format!("<|{language}|>")) {
             Ok(token_id) => Some(token_id),
             Err(_) => anyhow::bail!("language {language} is not supported"),
-        },
-        (false, Some(_)) => {
-            anyhow::bail!("a language cannot be set for non-multilingual models")
         }
+    } else {
+        None
     };
     let mut dc = Decoder::new(
         model,
         tokenizer,
-        args.seed,
+        seed,
         &device,
         language_token,
-        args.task,
-        args.timestamps,
-        args.verbose,
+        Some(task),
+        timestamps,
+        true,
     )?;
-    dc.run(&mel)?;
+    dbg!(dc.run(&mel)?);
     Ok(())
 }
